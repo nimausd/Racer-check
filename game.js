@@ -82,11 +82,59 @@ function syncWallet() {
   document.head.appendChild(s);
 })();
 
+async function switchToBase() {
+  try {
+    await window.ethereum.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: BASE_CHAIN_HEX }]
+    });
+    return true;
+  } catch (switchErr) {
+    if (switchErr.code === 4902) {
+      try {
+        await window.ethereum.request({
+          method: "wallet_addEthereumChain",
+          params: [{
+            chainId: BASE_CHAIN_HEX,
+            chainName: "Base",
+            rpcUrls: [BASE_RPC],
+            nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+            blockExplorerUrls: [BASESCAN]
+          }]
+        });
+        return true;
+      } catch { return false; }
+    }
+    return false;
+  }
+}
+
 async function ensureContract() {
   if (contract) return contract;
   if (!wallet) return null;
   if (deploying) return null;
 
+  // ── Check / switch to Base network ──────────────────────────────
+  try {
+    const network = await wallet.provider.getNetwork();
+    if (Number(network.chainId) !== BASE_CHAIN_ID) {
+      const switched = await switchToBase();
+      if (!switched) {
+        console.error("User rejected network switch to Base");
+        return null;
+      }
+      // Re-create signer after network switch
+      if (window._walletProvider) {
+        await window._walletProvider.send("eth_requestAccounts", []);
+        wallet.signer   = await window._walletProvider.getSigner();
+        wallet.provider = window._walletProvider;
+      }
+    }
+  } catch (netErr) {
+    console.warn("Network check failed:", netErr);
+  }
+
+  // ── Try existing deployed contract ───────────────────────────────
   if (contractAddr) {
     try {
       const existing = new ethers.Contract(contractAddr, CONTRACT_ABI, wallet.signer);
@@ -99,17 +147,24 @@ async function ensureContract() {
     }
   }
 
+  // ── Deploy new contract ──────────────────────────────────────────
   deploying = true;
   try {
     const factory  = new ethers.ContractFactory(CONTRACT_ABI, CONTRACT_BYTECODE, wallet.signer);
-    const deployed = await factory.deploy();
-    await deployed.waitForDeployment();
-    contractAddr = await deployed.getAddress();
+    const deployed = await factory.deploy({ gasLimit: 3_000_000n });
+    contractAddr   = typeof deployed.target !== "undefined"
+      ? deployed.target                        // ethers v6
+      : deployed.address;                      // ethers v5
+    await (deployed.deploymentTransaction
+      ? deployed.deploymentTransaction().wait(1)  // ethers v6
+      : deployed.deployTransaction.wait(1));       // ethers v5
     localStorage.setItem("br_contract", contractAddr);
-    contract = deployed;
+    contract = new ethers.Contract(contractAddr, CONTRACT_ABI, wallet.signer);
     return contract;
   } catch(err) {
     console.error("Deploy failed:", err);
+    contractAddr = null;
+    localStorage.removeItem("br_contract");
     return null;
   } finally {
     deploying = false;
@@ -124,43 +179,57 @@ async function submitScoreOnChain(points, secs) {
   const msgEl  = document.getElementById("tx-msg");
   const linkEl = document.getElementById("tx-link");
 
-  if (txEl)   txEl.classList.remove("hidden");
+  const showMsg = (text, hide = false) => {
+    if (msgEl) msgEl.textContent = text;
+    if (txEl)  txEl.classList.toggle("hidden", hide);
+    if (hide && doneEl) doneEl.classList.add("hidden");
+  };
+
+  showMsg(contract ? "Confirm in wallet…" : "Deploying contract on Base…");
   if (doneEl) doneEl.classList.add("hidden");
 
   try {
-    if (msgEl) msgEl.textContent = contract ? "Confirm in wallet…" : "Confirm contract deploy in wallet…";
     const c = await ensureContract();
-    if (!c) throw new Error("Contract unavailable");
+    if (!c) {
+      showMsg("Could not deploy contract. Check network & ETH balance.");
+      setTimeout(() => { if (txEl) txEl.classList.add("hidden"); }, 5000);
+      return;
+    }
 
-    if (msgEl) msgEl.textContent = "Submitting score…";
+    showMsg("Submitting score — confirm in wallet…");
     const tx = await c.submitScore(BigInt(points), BigInt(secs));
-    if (msgEl) msgEl.textContent = "Broadcasting…";
-    await tx.wait(1);
+    showMsg("Broadcasting…");
+    const receipt = await tx.wait(1);
 
     if (txEl)   txEl.classList.add("hidden");
     if (doneEl) doneEl.classList.remove("hidden");
-    if (linkEl) {
-      linkEl.href        = `${BASESCAN}/tx/${tx.hash}`;
-      linkEl.textContent = `Tx: ${tx.hash.slice(0,8)}…${tx.hash.slice(-6)}`;
+    const txHash = receipt?.hash ?? tx.hash;
+    if (linkEl && txHash) {
+      linkEl.href        = `${BASESCAN}/tx/${txHash}`;
+      linkEl.textContent = `Tx: ${txHash.slice(0,8)}…${txHash.slice(-6)}`;
     }
 
   } catch(err) {
-    if (txEl) txEl.classList.add("hidden");
+    console.error("submitScoreOnChain error:", err);
 
-    if (err.code === 4001 || err.code === "ACTION_REJECTED") {
-      if (msgEl) msgEl.textContent = "Transaction rejected.";
-      if (txEl)  txEl.classList.remove("hidden");
-      setTimeout(() => { if (txEl) txEl.classList.add("hidden"); }, 3000);
-    } else if (err.code === "INSUFFICIENT_FUNDS" || /insufficient funds/i.test(err.message||"")) {
-      if (msgEl) msgEl.textContent = "Not enough ETH on Base for gas.";
-      if (txEl)  txEl.classList.remove("hidden");
-      setTimeout(() => { if (txEl) txEl.classList.add("hidden"); }, 4000);
-    } else {
-      console.error("submitScoreOnChain error:", err);
-      if (msgEl) msgEl.textContent = "Transaction failed.";
-      if (txEl)  txEl.classList.remove("hidden");
-      setTimeout(() => { if (txEl) txEl.classList.add("hidden"); }, 4000);
+    const msg  = err?.message || "";
+    const code = err?.code    || err?.error?.code || "";
+
+    let userMsg = "Transaction failed.";
+    if (code === 4001 || code === "ACTION_REJECTED" || /user (denied|rejected)/i.test(msg)) {
+      userMsg = "Transaction rejected by user.";
+    } else if (code === "INSUFFICIENT_FUNDS" || /insufficient funds/i.test(msg)) {
+      userMsg = "Not enough ETH on Base for gas.";
+    } else if (/wrong network|chain/i.test(msg)) {
+      userMsg = "Wrong network — please switch to Base.";
+    } else if (/nonce/i.test(msg)) {
+      userMsg = "Nonce error — please try again.";
+    } else if (/gas/i.test(msg)) {
+      userMsg = "Gas estimation failed — try again.";
     }
+
+    showMsg(userMsg);
+    setTimeout(() => { if (txEl) txEl.classList.add("hidden"); }, 5000);
   }
 }
 
@@ -642,4 +711,4 @@ function endGame() {
   if (el("tx-done"))     el("tx-done").classList.add("hidden");
   if (el("gameover-card")) el("gameover-card").classList.add("show");
   submitScoreOnChain(fs, ss);
-}
+    }
